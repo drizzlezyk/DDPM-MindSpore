@@ -6,7 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
 import numpy as np
-
+import functools
 import mindspore
 import mindspore.dataset.vision as transformer
 import mindspore.common.dtype as ms_type
@@ -25,6 +25,20 @@ from mindspore.common.initializer import initializer, HeUniform, Uniform, \
 from ema import EMA
 
 gpu_target = (context.get_context("device_target") == "GPU")
+# context.set_context(mode=context.PYNATIVE_MODE)
+ascend_target = (context.get_context("device_target") == "Ascend")
+gpu_float_status = ops.FloatStatus()
+npu_alloc_float_status = ops.NPUAllocFloatStatus()
+npu_clear_float_status = ops.NPUClearFloatStatus()
+npu_get_float_status = ops.NPUGetFloatStatus()
+if ascend_target:
+    status = npu_alloc_float_status()
+    _ = npu_clear_float_status(status)
+else:
+    status = None
+
+hyper_map = ops.HyperMap()
+partial = ops.Partial()
 
 
 def rsqrt(x):
@@ -60,9 +74,9 @@ def save_images(all_images_list, path):
         image = image * 255 + 0.5
         image = np.clip(image, 0, 255).astype(np.uint8)
         image = image.transpose((1, 2, 0))
-        im = Image.fromarray(image)
+        image = Image.fromarray(image)
         save_path = os.path.join(path, f'{i}-img.png')
-        im.save(save_path)
+        image.save(save_path)
 
 
 def calcu_output_size(input_tensor, scale_factor, mode):
@@ -86,12 +100,12 @@ def calcu_output_size(input_tensor, scale_factor, mode):
 
 class Residual(nn.Cell):
     """残差块"""
-    def __init__(self, function):
+    def __init__(self, fn):
         super().__init__()
-        self.fn = function
+        self.fn = fn
 
     def construct(self, x, *args, **kwargs):
-        return self.function(x, *args, **kwargs) + x
+        return self.fn(x, *args, **kwargs) + x
 
 
 class UpSample(nn.Cell):
@@ -194,16 +208,16 @@ class LayerNorm(nn.Cell):
 
 
 class PreNorm(nn.Cell):
-    def __init__(self, dim, function):
+    def __init__(self, dim, fn):
         super().__init__()
-        self.function = function
+        self.fn = fn
         self.norm = LayerNorm(dim)
 
     def construct(self, x):
         x = self.norm(x)
-        return self.function(x)
+        return self.fn(x)
 
-# same with pytorch
+
 class SinusoidalPosEmb(nn.Cell):
     def __init__(self, dim):
         super().__init__()
@@ -218,7 +232,6 @@ class SinusoidalPosEmb(nn.Cell):
         return emb
 
 
-# same with pytorch
 class RandomOrLearnedSinusoidalPosEmb(nn.Cell):
     def __init__(self, dim, is_random=False):
         super().__init__()
@@ -235,7 +248,6 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Cell):
         return fouriered
 
 
-# same with pytorch
 class Block(nn.Cell):
     def __init__(self, dim, dim_out, groups=8):
         super().__init__()
@@ -255,7 +267,6 @@ class Block(nn.Cell):
         return x
 
 
-# same with pytorch
 class ResnetBlock(nn.Cell):
     def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
         super().__init__()
@@ -339,21 +350,6 @@ class Attention(nn.Cell):
         return self.to_out(out)
 
 
-ascend_target = (context.get_context("device_target") == "Ascend")
-gpu_float_status = ops.FloatStatus()
-npu_alloc_float_status = ops.NPUAllocFloatStatus()
-npu_clear_float_status = ops.NPUClearFloatStatus()
-npu_get_float_status = ops.NPUGetFloatStatus()
-if ascend_target:
-    status = npu_alloc_float_status()
-    _ = npu_clear_float_status(status)
-else:
-    status = None
-
-hyper_map = ops.HyperMap()
-partial = ops.Partial()
-
-
 def is_finite(inputs):
     """whether input tensor is finite."""
     if gpu_target:
@@ -371,7 +367,7 @@ def all_finite(inputs):
     #     status_finite = status.sum() == 0
     #     _ = npu_clear_float_status(status)
     #     return status_finite
-    outputs = hyper_map(partial(is_finite), inputs)
+    outputs = _calculate_fan_in_and_fan_out(hyper_map)(partial(is_finite), inputs)
     return ops.stack(outputs).all()
 
 
@@ -473,9 +469,9 @@ class Unet(nn.Cell):
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
-        import functools
         block_klass = functools.partial(ResnetBlock, groups=resnet_block_groups)
 
+        # time embeddings
         # time embeddings
         time_dim = dim * 4
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
@@ -532,6 +528,7 @@ class Unet(nn.Cell):
 
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
         self.final_conv = Conv2d(dim, self.out_dim, 1, pad_mode='valid', has_bias=True)
+        self.zeros_like = ops.ZerosLike()
 
     def construct(self, x, time, x_self_cond):
         if self.self_condition:
@@ -750,7 +747,6 @@ class GaussianDiffusion(nn.Cell):
     @ms_function
     def model_predictions(self, x, t, x_self_cond=None, clip_x_start=False):
         model_output = self.model(x, t, x_self_cond)
-
         def maybe_clip(x, clip):
             if clip:
                 return x.clip(-1., 1.)
@@ -821,7 +817,6 @@ class GaussianDiffusion(nn.Cell):
         # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
         times = list(reversed(times.tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))
-
         img = np.random.randn(*shape).astype(np.float32)
         x_start = None
 
@@ -939,15 +934,22 @@ class Trainer:
         use_static=True,
         akg=True,
         distributed=False,
+        inference=False
     ):
         super().__init__()
         device_id = int(os.getenv('DEVICE_ID', "0"))
         mindspore.set_context(device_id=device_id)
+        # mindspore.context.set_context(device_target="CPU")
         backend = mindspore.get_context('device_target')
-        if use_static and akg and backend != 'Ascend':
+
+        if ascend_target:
+            context.set_context(mode=context.GRAPH_MODE, device_target="Ascend", enable_hccl=True,
+                                device_id=device_id)
+            init()
+
+        elif use_static and akg and backend != 'Ascend':
             mindspore.set_context(enable_graph_kernel=True, graph_kernel_flags="--opt_level=1")
 
-        # distributed training
         self.distributed = distributed
         if distributed:
             init()
@@ -971,20 +973,19 @@ class Trainer:
         self.image_size = diffusion_model.image_size
 
         # dataset and dataloader
-        if isinstance(folder_or_dataset, str):
-            self.dataset = create_dataset(folder_or_dataset, self.image_size,
-                                          augment_horizontal_flip=augment_horizontal_flip,
-                                          batch_size=train_batch_size, shuffle=True)
-        elif isinstance(folder_or_dataset, (VisionBaseDataset, GeneratorDataset, MindDataset)):
-            self.dataset = folder_or_dataset
-        else:
-            raise ValueError(f"the value of 'folder_or_dataset' should be a str or Dataset,"
-                             f" but get {folder_or_dataset}.")
+        self.dataset = None
 
-        dataset_size = self.dataset.get_dataset_size()
-        print("training dataset size:", dataset_size)
-        self.dataset = self.dataset.repeat(
-            int(train_num_steps * gradient_accumulate_every // dataset_size) + 1)
+        if not inference:
+            if isinstance(folder_or_dataset, str):
+                self.dataset = create_dataset(folder_or_dataset, self.image_size,
+                                              augment_horizontal_flip=augment_horizontal_flip,
+                                              batch_size=train_batch_size, shuffle=True)
+            elif isinstance(folder_or_dataset, (VisionBaseDataset, GeneratorDataset, MindDataset)):
+                self.dataset = folder_or_dataset
+            dataset_size = self.dataset.get_dataset_size()
+            print("training dataset size:", dataset_size)
+            self.dataset = self.dataset.repeat(
+                int(train_num_steps * gradient_accumulate_every // dataset_size) + 1)
 
         # optimizer
         self.opt = nn.Adam(diffusion_model.trainable_params(),
@@ -1014,6 +1015,8 @@ class Trainer:
     def load(self, load_path):
         param_dict = load_checkpoint(load_path)
         load_param_into_net(self.model, param_dict)
+        print("load success")
+        return True
 
     def save_images(self, all_images_list, milestone):
         image_folder = str(self.results_folder) + f'/image-{milestone}'
@@ -1021,17 +1024,22 @@ class Trainer:
 
     def inference(self):
         batches = num_to_groups(self.num_samples, self.batch_size)
+        self.ema.set_train(False)
+        self.ema.synchronize()
         all_images_list = list(map(lambda n: self.ema.online_model.sample(batch_size=n), batches))
+        self.ema.desynchronize()
         return all_images_list
 
     def train(self):
         model = self.model
         accumulator = self.accumulator
+        gradient_accumulate_every = self.gradient_accumulate_every
         # model.to_float(ms_type.float16)
         # model = auto_mixed_precision(model, self.amp_level)
 
+        @ms_function()
         def forward_fn(data, time_vec):
-            return model(data, time_vec) / self.gradient_accumulate_every
+            return model(data, time_vec) / gradient_accumulate_every
 
         grad_fn = grad_cell(forward_fn, self.opt.parameters)
 
@@ -1043,7 +1051,7 @@ class Trainer:
                 current_loss = ops.depend(current_loss, accumulator(grads))
 
             return current_loss
-
+        assert self.dataset, "please provide dataset object or data path"
         data_iterator = self.dataset.create_tuple_iterator()
 
         print('training start')
@@ -1062,15 +1070,15 @@ class Trainer:
                 total_loss += float(loss.asnumpy())
 
                 self.step += 1
-                if self.step % self.gradient_accumulate_every == 0:
+                if self.step % gradient_accumulate_every == 0:
                     # ema和model的参数同步更新
                     self.ema.update()
                     pbar.set_description(f'loss: {total_loss:.4f}')
                     pbar.update(1)
                     total_loss = 0.
 
-                accumulate_step = self.step // self.gradient_accumulate_every
-                accumulate_remain_step = self.step % self.gradient_accumulate_every
+                accumulate_step = self.step // gradient_accumulate_every
+                accumulate_remain_step = self.step % gradient_accumulate_every
                 if self.step != 0 and accumulate_step % self.save_and_sample_every == 0\
                         and accumulate_remain_step == 0:
 
@@ -1083,7 +1091,8 @@ class Trainer:
                     self.save(accumulate_step)
                     self.ema.desynchronize()
 
-                if self.step >= self.gradient_accumulate_every * self.train_num_steps:
+                if self.step >= gradient_accumulate_every * self.train_num_steps:
                     break
 
         print('training complete')
+
