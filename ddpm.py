@@ -6,44 +6,37 @@ from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
 import numpy as np
-import functools
+
 import mindspore
-import mindspore.dataset.vision as transformer
+import mindspore.dataset.vision.c_transforms as transformer
+import mindspore.dataset.vision.py_transforms as py_transformer
 import mindspore.common.dtype as ms_type
 
 from mindspore import ops, nn, ms_function, save_checkpoint, load_checkpoint,\
     load_param_into_net, set_auto_parallel_context, Tensor, Parameter, context, ms_class
-
-from mindspore.communication import init
-from mindspore.dataset import VisionBaseDataset, GeneratorDataset, MindDataset, ImageFolderDataset
-from mindspore.ops import GradOperation
+from mindspore.ops import constexpr, stop_gradient, GradOperation
 from mindspore.ops.operations.image_ops import ResizeBilinearV2, ResizeLinear1D
-from mindspore.nn import Dense
+from mindspore.communication import init, get_rank
+from mindspore.dataset import VisionBaseDataset, GeneratorDataset, MindDataset, ImageFolderDataset
 from mindspore.common.initializer import initializer, HeUniform, Uniform, \
     Normal, _calculate_fan_in_and_fan_out
+from mindspore.ops._primitive_cache import _get_cache_prim
+from mindspore.parallel._utils import _get_device_num, _get_gradients_mean
 
 from ema import EMA
-
-gpu_target = (context.get_context("device_target") == "GPU")
-# context.set_context(mode=context.PYNATIVE_MODE)
-ascend_target = (context.get_context("device_target") == "Ascend")
-gpu_float_status = ops.FloatStatus()
-npu_alloc_float_status = ops.NPUAllocFloatStatus()
-npu_clear_float_status = ops.NPUClearFloatStatus()
-npu_get_float_status = ops.NPUGetFloatStatus()
-if ascend_target:
-    status = npu_alloc_float_status()
-    _ = npu_clear_float_status(status)
-else:
-    status = None
-
-hyper_map = ops.HyperMap()
-partial = ops.Partial()
+from amp import DynamicLossScaler, StaticLossScaler, NoLossScaler, auto_mixed_precision, all_finite, BMM
 
 
 def rsqrt(x):
-    rsqrt_op = ops.Rsqrt()
+    rsqrt_op = _get_cache_prim(ops.Rsqrt)()
     return rsqrt_op(x)
+
+
+def randn_like(x, dtype=None):
+    if dtype is None:
+        dtype = x.dtype
+    normal = _get_cache_prim(ops.StandardNormal)()
+    return normal(x.shape).astype(dtype)
 
 
 def rearrange(head, inputs):
@@ -74,9 +67,9 @@ def save_images(all_images_list, path):
         image = image * 255 + 0.5
         image = np.clip(image, 0, 255).astype(np.uint8)
         image = image.transpose((1, 2, 0))
-        image = Image.fromarray(image)
+        im = Image.fromarray(image)
         save_path = os.path.join(path, f'{i}-img.png')
-        image.save(save_path)
+        im.save(save_path)
 
 
 def calcu_output_size(input_tensor, scale_factor, mode):
@@ -108,6 +101,32 @@ class Residual(nn.Cell):
         return self.fn(x, *args, **kwargs) + x
 
 
+@constexpr
+def _check_scale_factor(shape, scale_factor):
+    if isinstance(scale_factor, tuple) and len(scale_factor) != len(shape[2:]):
+        raise ValueError(f"the number of 'scale_fator' must match to inputs.shape[2:], "
+                         f"but get scale_factor={scale_factor}, inputs.shape[2:]={shape[2:]}")
+
+
+def _interpolate_output_shape(shape, scales, sizes, mode):
+    """calculate output shape"""
+    if sizes is not None:
+        if mode == "nearest":
+            return sizes
+        return Tensor(sizes)
+
+    ret = ()
+    for i in range(len(shape[2:])):
+        if isinstance(scales, float):
+            out_i = int(scales * shape[i+2])
+        else:
+            out_i = int(scales[i] * shape[i+2])
+        ret = ret + (out_i,)
+    if mode == "nearest":
+        return ret
+    return Tensor(ret)
+
+
 class UpSample(nn.Cell):
     def __init__(self, size=None, scale_factor=None,
                  mode: str = 'nearest', align_corners=False):
@@ -115,7 +134,7 @@ class UpSample(nn.Cell):
         if mode not in ['nearest', 'linear', 'bilinear']:
             raise ValueError(f'do not support mode :{mode}.')
         if size and scale_factor:
-            raise ValueError("can not set 'size' and 'scale_factor' at the same time.")
+            raise ValueError(f"can not set 'size' and 'scale_fator' at the same time.")
         self.size = size
         if isinstance(scale_factor, tuple):
             self.scale_factor = tuple(float(factor) for factor in scale_factor)
@@ -125,22 +144,18 @@ class UpSample(nn.Cell):
         self.align_corners = align_corners
 
     def construct(self, inputs):
-        if not self.size:
-            sizes = calcu_output_size(inputs, self.scale_factor, self.mode)
-        else:
-            sizes = self.size
-
+        inputs_shape = inputs.shape
+        _check_scale_factor(inputs_shape, self.scale_factor)
+        sizes = _interpolate_output_shape(inputs_shape, self.scale_factor, self.size, self.mode)
         if self.mode == 'nearest':
-            interpolate = ops.ResizeNearestNeighbor(sizes, self.align_corners)
+            interpolate = _get_cache_prim(ops.ResizeNearestNeighbor)(sizes, self.align_corners)
             return interpolate(inputs)
-        if self.mode == 'linear':
-            interpolate = ResizeLinear1D('align_corners' if self.align_corners else 'half_pixel')
+        elif self.mode == 'linear':
+            interpolate = _get_cache_prim(ResizeLinear1D)('align_corners' if self.align_corners else 'half_pixel')
             return interpolate(inputs, sizes)
-        if self.mode == 'bilinear':
-            interpolate = ResizeBilinearV2(self.align_corners,
-                                           True if not self.align_corners else False)
+        elif self.mode == 'bilinear':
+            interpolate = _get_cache_prim(ResizeBilinearV2)(self.align_corners, True if self.align_corners==False else False)
             return interpolate(inputs, sizes)
-
         return inputs
 
 
@@ -162,8 +177,19 @@ class Conv2d(nn.Conv2d):
     def reset_parameters(self):
         # 同步pytorch, weight参数采用了He-uniform初始化策略
         self.weight.set_data(initializer(HeUniform(math.sqrt(5)), self.weight.shape))
-        # self.weight = Parameter(initializer(HeUniform(math.sqrt(5)),
-        #                                     self.weight.shape), name='weight')
+        if self.has_bias:
+            fan_in, _ = _calculate_fan_in_and_fan_out(self.weight.shape)
+            bound = 1 / math.sqrt(fan_in)
+            self.bias.set_data(initializer(Uniform(bound), [self.out_channels]))
+
+
+class Dense(nn.Dense):
+    def __init__(self, in_channels, out_channels, has_bias=True, activation=None):
+        super().__init__(in_channels, out_channels, weight_init='normal', bias_init='zeros', has_bias=has_bias, activation=activation)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.weight.set_data(initializer(HeUniform(math.sqrt(5)), self.weight.shape))
         if self.has_bias:
             fan_in, _ = _calculate_fan_in_and_fan_out(self.weight.shape)
             bound = 1 / math.sqrt(fan_in)
@@ -225,10 +251,11 @@ class SinusoidalPosEmb(nn.Cell):
         emb = math.log(10000) / (half_dim - 1)
         emb = np.exp(np.arange(half_dim) * - emb)
         self.emb = Tensor(emb, mindspore.float32)
+        self.Concat = _get_cache_prim(ops.Concat)(-1)
 
     def construct(self, x):
         emb = x[:, None] * self.emb[None, :]
-        emb = ops.concat((ops.sin(emb), ops.cos(emb)), axis=-1)
+        emb = self.Concat((ops.sin(emb), ops.cos(emb)))
         return emb
 
 
@@ -239,12 +266,13 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Cell):
         half_dim = dim // 2
         self.weights = Parameter(initializer(Normal(1.0), (half_dim,)), name='weights',
                                  requires_grad=not is_random)
+        self.Concat = _get_cache_prim(ops.Concat)(-1)
 
     def construct(self, x):
         x = x.expand_dims(1)
         freqs = x * self.weights.expand_dims(0) * 2 * Tensor(math.pi, mindspore.float32)
-        fouriered = ops.concat((ops.sin(freqs), ops.cos(freqs)), axis=-1)
-        fouriered = ops.concat((x, fouriered), axis=-1)
+        fouriered = self.Concat((ops.sin(freqs), ops.cos(freqs)))
+        fouriered = self.Concat((x, fouriered))
         return fouriered
 
 
@@ -277,14 +305,15 @@ class ResnetBlock(nn.Cell):
 
         self.block1 = Block(dim, dim_out, groups=groups)
         self.block2 = Block(dim_out, dim_out, groups=groups)
-        self.res_conv = Conv2d(dim, dim_out, 1) if dim != dim_out else ops.Identity()
+        self.res_conv = Conv2d(dim, dim_out, 1) if dim != dim_out else _get_cache_prim(ops.Identity)()
+        self.split = _get_cache_prim(ops.Split)(axis=1, output_num=2)
 
     def construct(self, x, time_emb=None):
         scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
             time_emb = time_emb.expand_dims(-1).expand_dims(-1)
-            scale_shift = time_emb.split(axis=1, output_num=2)
+            scale_shift = self.split(time_emb)
         h = self.block1(x, scale_shift=scale_shift)
         h = self.block2(h)
         return h + self.res_conv(x)
@@ -303,17 +332,20 @@ class LinearAttention(nn.Cell):
             LayerNorm(dim)
         )
 
-        self.map = ops.Map()
-        self.partial = ops.Partial()
-        self.bmm = ops.BatchMatMul()
+        self.map = _get_cache_prim(ops.Map)()
+        self.partial = _get_cache_prim(ops.Partial)()
+        self.bmm = _get_cache_prim(BMM)()
+        self.split = _get_cache_prim(ops.Split)(axis=1, output_num=3)
+        self.softmax1 = _get_cache_prim(ops.Softmax)(-1)
+        self.softmax2 = _get_cache_prim(ops.Softmax)(-2)
 
     def construct(self, x):
         b, c, h, w = x.shape
-        qkv = self.to_qkv(x).split(1, 3)
+        qkv = self.split(self.to_qkv(x))
         q, k, v = self.map(self.partial(rearrange, self.heads), qkv)
 
-        q = ops.softmax(q, -2)
-        k = ops.softmax(k, -1)
+        q = self.softmax2(q)
+        k = self.softmax1(k)
 
         q = q * self.scale
         v = v / (h * w)
@@ -332,22 +364,44 @@ class Attention(nn.Cell):
         self.heads = heads
         hidden_dim = dim_head * heads
 
-        self.to_qkv = Conv2d(dim, hidden_dim * 3, 1, pad_mode='valid', has_bias=False)
-        self.to_out = Conv2d(hidden_dim, dim, 1, pad_mode='valid', has_bias=True)
+        self.to_qkv = _get_cache_prim(Conv2d)(dim, hidden_dim * 3, 1, pad_mode='valid', has_bias=False)
+        self.to_out = _get_cache_prim(Conv2d)(hidden_dim, dim, 1, pad_mode='valid', has_bias=True)
         self.map = ops.Map()
         self.partial = ops.Partial()
-        self.bmm = ops.BatchMatMul()
+        self.bmm = BMM()
+        self.split = ops.Split(axis=1, output_num=3)
+        self.softmax = ops.Softmax(-1)
 
     def construct(self, x):
         b, c, h, w = x.shape
-        qkv = self.to_qkv(x).split(1, 3)
+        qkv = self.split(self.to_qkv(x))
         q, k, v = self.map(self.partial(rearrange, self.heads), qkv)
         q = q * self.scale
         sim = self.bmm(q.swapaxes(2, 3), k)
-        attn = ops.softmax(sim, -1)
+        attn = self.softmax(sim)
         out = self.bmm(attn, v.swapaxes(2, 3))
         out = out.swapaxes(-1, -2).reshape((b, -1, h, w))
         return self.to_out(out)
+
+
+grad_func = GradOperation(True, False, False)
+grad_cell = GradOperation(False, True, False)
+gpu_target = (context.get_context("device_target") == "GPU")
+context.set_context(mode=context.GRAPH_MODE)
+ascend_target = (context.get_context("device_target") == "Ascend")
+gpu_float_status = ops.FloatStatus()
+npu_alloc_float_status = ops.NPUAllocFloatStatus()
+npu_clear_float_status = ops.NPUClearFloatStatus()
+npu_get_float_status = ops.NPUGetFloatStatus()
+
+if ascend_target:
+    status = npu_alloc_float_status()
+    _ = npu_clear_float_status(status)
+else:
+    status = None
+
+hyper_map = ops.HyperMap()
+partial = ops.Partial()
 
 
 def is_finite(inputs):
@@ -358,20 +412,32 @@ def is_finite(inputs):
     return state.all()
 
 
-def all_finite(inputs):
-    """whether all inputs tensor are finite."""
-    # if ascend_target:
-    #     status = ops.depend(status, inputs)
-    #     get_status = npu_get_float_status(status)
-    #     status = ops.depend(status, get_status)
-    #     status_finite = status.sum() == 0
-    #     _ = npu_clear_float_status(status)
-    #     return status_finite
-    outputs = _calculate_fan_in_and_fan_out(hyper_map)(partial(is_finite), inputs)
-    return ops.stack(outputs).all()
+def value_and_grad(fn, pos=None, params=None, has_aux=False):
+    if params is None:
+        grad_ = grad_func
+    else:
+        grad_ = grad_cell
 
+    def fn_aux(*args):
+        outputs = fn(*args)
+        no_grad_outputs = (outputs[0],)
+        for out in outputs[1:]:
+            no_grad_outputs += (stop_gradient(out),)
+        return no_grad_outputs
 
-grad_cell = GradOperation(False, True, False)
+    if has_aux:
+        fn_ = fn_aux
+    else:
+        fn_ = fn
+
+    def value_and_grad_f(*args):
+        values = fn_(*args)
+        if params is None:
+            grads = grad_(fn_)(*args)
+        else:
+            grads = grad_(fn_, params)(*args)
+        return values, grads
+    return value_and_grad_f
 
 
 def has_int_square_root(num):
@@ -388,18 +454,17 @@ def num_to_groups(num, divisor):
 
 
 def create_dataset(folder, image_size, extensions=None, augment_horizontal_flip=False,
-                   batch_size=32, shuffle=True, num_workers=cpu_count()):
+                   batch_size=1, shuffle=True, num_workers=cpu_count()):
     extensions = ['.jpg', '.jpeg', '.png', '.tiff'] if not extensions else extensions
     dataset = ImageFolderDataset(folder, num_parallel_workers=num_workers, shuffle=False,
                                  extensions=extensions, decode=True)
 
     transformers = [
-        # CenterCrop(image_size*2),
-        transformer.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
         transformer.Resize([image_size, image_size], transformer.Inter.BILINEAR),
-        transformer.ToTensor()
+        py_transformer.ToTensor()
     ]
-
+    if augment_horizontal_flip:
+        transformers.append(transformer.RandomHorizontalFlip())
     dataset = dataset.project('image')
     dataset = dataset.map(transformers, 'image')
     if shuffle:
@@ -428,10 +493,8 @@ class Accumulator:
         success = self.map(self.partial(ops.assign_add), self.inner_grads, grads)
         if self.counter % self.accumulate_step == 0:
             clip_grads = ops.clip_by_global_norm(self.inner_grads, self.clip_norm)
-            success = ops.depend(success,
-                                 self.optimizer(clip_grads))
-            success = ops.depend(success,
-                                 self.map(self.partial(ops.assign), self.inner_grads, self.zeros))
+            success = ops.depend(success, self.optimizer(clip_grads))
+            success = ops.depend(success, self.map(self.partial(ops.assign), self.inner_grads, self.zeros))
 
         success = ops.depend(success, ops.assign_add(self.counter, Tensor(1, mindspore.int32)))
 
@@ -469,9 +532,9 @@ class Unet(nn.Cell):
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+        import functools
         block_klass = functools.partial(ResnetBlock, groups=resnet_block_groups)
 
-        # time embeddings
         # time embeddings
         time_dim = dim * 4
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
@@ -527,14 +590,17 @@ class Unet(nn.Cell):
         self.out_dim = default(out_dim, default_out_dim)
 
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
+        self.final_res_block.recompute()
         self.final_conv = Conv2d(dim, self.out_dim, 1, pad_mode='valid', has_bias=True)
-        self.zeros_like = ops.ZerosLike()
+        self.final_conv.recompute()
+        self.Concat = ops.Concat(axis=1)
+        self.Concat.recompute()
 
     def construct(self, x, time, x_self_cond):
         if self.self_condition:
             if x_self_cond is None:
                 x_self_cond = ops.zeros_like(x)
-            x = ops.concat((x_self_cond, x), 1)
+            x = self.Concat((x_self_cond, x))
         x = self.init_conv(x)
         r = x.copy()
         t = self.time_mlp(time)
@@ -556,18 +622,18 @@ class Unet(nn.Cell):
 
         len_h = len(h) - 1
         for block1, block2, attn, upsample in self.ups:
-            x = ops.concat((x, h[len_h]), 1)
+            x = self.Concat((x, h[len_h]))
             len_h -= 1
             x = block1(x, t)
 
-            x = ops.concat((x, h[len_h]), 1)
+            x = self.Concat((x, h[len_h]))
             len_h -= 1
             x = block2(x, t)
             x = attn(x)
 
             x = upsample(x)
 
-        x = ops.concat((x, r), 1)
+        x = self.Concat((x, r))
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
@@ -593,14 +659,14 @@ def linear_beta_schedule(timesteps):
     return np.linspace(beta_start, beta_end, timesteps).astype(np.float32)
 
 
-def cosine_beta_schedule(timesteps, s=0.008):
+def cosine_beta_schedule(time_steps, s=0.008):
     """
     cosine schedule
     as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
     """
-    steps = timesteps + 1
-    x = np.linspace(0, timesteps, steps).astype(np.float32)
-    alphas_cumprod = np.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    steps = time_steps + 1
+    x = np.linspace(0, time_steps, steps).astype(np.float32)
+    alphas_cumprod = np.cos(((x / time_steps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return np.clip(betas, 0, 0.999)
@@ -609,11 +675,11 @@ def cosine_beta_schedule(timesteps, s=0.008):
 def generate_noise(x, data_type=None):
     if data_type is None:
         data_type = x.dtype
-    normal = ops.StandardNormal()
+    normal = _get_cache_prim(ops.StandardNormal)()
     return normal(x.shape).astype(data_type)
 
 
-def generate_t_tensor(t, data_type=mindspore.float32):
+def generate_t_tensor(t, data_type=mindspore.float16):
     return Tensor(t, data_type)
 
 
@@ -747,6 +813,7 @@ class GaussianDiffusion(nn.Cell):
     @ms_function
     def model_predictions(self, x, t, x_self_cond=None, clip_x_start=False):
         model_output = self.model(x, t, x_self_cond)
+
         def maybe_clip(x, clip):
             if clip:
                 return x.clip(-1., 1.)
@@ -788,7 +855,7 @@ class GaussianDiffusion(nn.Cell):
         batched_times = ops.ones((x.shape[0],), mindspore.int32) * t
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
             x=x, t=batched_times, x_self_cond=x_self_cond, clip_denoised=clip_denoise)
-        noise = generate_noise(x) if t > 0 else ops.zeros_like(x)
+        noise = randn_like(x) if t > 0 else ops.zeros_like(x)  # no noise if t == 0
         predict_img = model_mean + ops.exp(0.5 * model_log_variance) * noise
         return predict_img, x_start
 
@@ -817,6 +884,7 @@ class GaussianDiffusion(nn.Cell):
         # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
         times = list(reversed(times.tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))
+
         img = np.random.randn(*shape).astype(np.float32)
         x_start = None
 
@@ -876,14 +944,16 @@ class GaussianDiffusion(nn.Cell):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t):
-        noise = generate_noise(x_start)
+    def p_losses(self, x_start, t, noise, random_cond):
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        if self.self_condition and random.random() < 0.5:
-            _, x_self_cond = self.model_predictions(x, t)
-            x_self_cond = ops.stop_gradient(x_self_cond)
+        if self.self_condition:
+            if random_cond:
+                _, x_self_cond = self.model_predictions(x, t)
+                x_self_cond = ops.stop_gradient(x_self_cond)
+            else:
+                x_self_cond = ops.zeros_like(x)
         else:
             x_self_cond = ops.zeros_like(x)
 
@@ -905,9 +975,9 @@ class GaussianDiffusion(nn.Cell):
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
         return loss.mean()
 
-    def construct(self, img, t):
+    def construct(self, img, t, noise, random_cond):
         img = self.normalize(img)
-        return self.p_losses(img, t)
+        return self.p_losses(img, t, noise, random_cond)
 
 
 class Trainer:
@@ -931,35 +1001,38 @@ class Trainer:
         num_samples=5,
         results_folder='./results',
         dynamic_loss_scale=False,
+        self_condition=True,
         use_static=True,
         akg=True,
         distributed=False,
-        inference=False
+        jit=True,
+        amp_level="O1"
     ):
         super().__init__()
+        self.amp_level = amp_level
+        self.self_condition = self_condition
         device_id = int(os.getenv('DEVICE_ID', "0"))
         mindspore.set_context(device_id=device_id)
-        # mindspore.context.set_context(device_target="CPU")
         backend = mindspore.get_context('device_target')
+        if jit and akg and backend != 'Ascend':
+            mindspore.set_context(enable_graph_kernel=True, graph_kernel_flags="--opt_level=1", mode=context.GRAPH_MODE)
 
-        if ascend_target:
-            context.set_context(mode=context.GRAPH_MODE, device_target="Ascend", enable_hccl=True,
-                                device_id=device_id)
-            init()
-
-        elif use_static and akg and backend != 'Ascend':
-            mindspore.set_context(enable_graph_kernel=True, graph_kernel_flags="--opt_level=1")
-
+        # distributed training
         self.distributed = distributed
         if distributed:
             init()
+            rank_id = get_rank()
             set_auto_parallel_context(parallel_mode=mindspore.ParallelMode.DATA_PARALLEL,
                                       gradients_mean=True)
+        else:
+            rank_id = 0
 
-        self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
+        self.is_main_process = True if rank_id == 0 else False
+        if self.is_main_process:
+            self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
 
-        self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok=True)
+            self.results_folder = Path(results_folder)
+            self.results_folder.mkdir(exist_ok=True)
 
         square_info = 'number of samples must have an integer square root'
         assert has_int_square_root(num_samples), square_info
@@ -973,19 +1046,20 @@ class Trainer:
         self.image_size = diffusion_model.image_size
 
         # dataset and dataloader
-        self.dataset = None
+        if isinstance(folder_or_dataset, str):
+            self.dataset = create_dataset(folder_or_dataset, self.image_size,
+                                          augment_horizontal_flip=augment_horizontal_flip,
+                                          batch_size=train_batch_size, shuffle=True)
+        elif isinstance(folder_or_dataset, (VisionBaseDataset, GeneratorDataset, MindDataset)):
+            self.dataset = folder_or_dataset
+        else:
+            raise ValueError(f"the value of 'folder_or_dataset' should be a str or Dataset,"
+                             f" but get {folder_or_dataset}.")
 
-        if not inference:
-            if isinstance(folder_or_dataset, str):
-                self.dataset = create_dataset(folder_or_dataset, self.image_size,
-                                              augment_horizontal_flip=augment_horizontal_flip,
-                                              batch_size=train_batch_size, shuffle=True)
-            elif isinstance(folder_or_dataset, (VisionBaseDataset, GeneratorDataset, MindDataset)):
-                self.dataset = folder_or_dataset
-            dataset_size = self.dataset.get_dataset_size()
-            print("training dataset size:", dataset_size)
-            self.dataset = self.dataset.repeat(
-                int(train_num_steps * gradient_accumulate_every // dataset_size) + 1)
+        dataset_size = self.dataset.get_dataset_size()
+        print("training dataset size:", dataset_size)
+        self.dataset = self.dataset.repeat(
+            int(train_num_steps * gradient_accumulate_every // dataset_size) + 1)
 
         # optimizer
         self.opt = nn.Adam(diffusion_model.trainable_params(),
@@ -1015,8 +1089,6 @@ class Trainer:
     def load(self, load_path):
         param_dict = load_checkpoint(load_path)
         load_param_into_net(self.model, param_dict)
-        print("load success")
-        return True
 
     def save_images(self, all_images_list, milestone):
         image_folder = str(self.results_folder) + f'/image-{milestone}'
@@ -1024,47 +1096,66 @@ class Trainer:
 
     def inference(self):
         batches = num_to_groups(self.num_samples, self.batch_size)
-        self.ema.set_train(False)
-        self.ema.synchronize()
         all_images_list = list(map(lambda n: self.ema.online_model.sample(batch_size=n), batches))
-        self.ema.desynchronize()
         return all_images_list
 
     def train(self):
         model = self.model
         accumulator = self.accumulator
         gradient_accumulate_every = self.gradient_accumulate_every
-        # model.to_float(ms_type.float16)
-        # model = auto_mixed_precision(model, self.amp_level)
+        model = auto_mixed_precision(model, "O1")
+        grad_reducer = ops.identity
+        num_timesteps = model.num_timesteps
+        if self.distributed:
+            mean = _get_gradients_mean()
+            degree = _get_device_num()
+            grad_reducer = nn.DistributedGradReducer(self.opt.parameters, mean, degree)
+        else:
+            grad_reducer = ops.identity
 
-        @ms_function()
-        def forward_fn(data, time_vec):
-            return model(data, time_vec) / gradient_accumulate_every
+        if self.amp_level != 'O0':
+            if self.dynamic_loss_scale:
+                loss_scaler = DynamicLossScaler(65536, 2, 1000)
+            else:
+                loss_scaler = StaticLossScaler(65536)
+        else:
+            loss_scaler = NoLossScaler()
 
-        grad_fn = grad_cell(forward_fn, self.opt.parameters)
+        def forward_fn(data, t, noise, self_cond):
+            loss = model(data, t, noise, self_cond)
+            loss = loss / gradient_accumulate_every
+            loss = loss_scaler.scale(loss)
+            return loss
 
-        @ms_function()
-        def train_step(data, time_vec):
-            current_loss = forward_fn(data, time_vec)
-            grads = grad_fn(data, time_vec)
-            if all_finite(grads):
-                current_loss = ops.depend(current_loss, accumulator(grads))
+        grad_fn = value_and_grad(forward_fn, None, self.opt.parameters)
 
-            return current_loss
-        assert self.dataset, "please provide dataset object or data path"
+        def train_step(data, t, noise, self_cond):
+            loss, grads = grad_fn(data, t, noise, self_cond)
+            grads = grad_reducer(grads)
+            status = all_finite(grads)
+            if status:
+                loss = loss_scaler.unscale(loss)
+                grads = loss_scaler.unscale(grads)
+                loss = ops.depend(loss, accumulator(grads))
+            loss = ops.depend(loss, loss_scaler.adjust(status))
+            return loss
+
+        train_step = ms_function(train_step)
+
         data_iterator = self.dataset.create_tuple_iterator()
 
         print('training start')
         with tqdm(initial=self.step, total=self.train_num_steps, disable=False) as pbar:
             total_loss = 0.
             for (img,) in data_iterator:
-                model.set_train(True)
+                model.set_train()
                 # # 随机采样time向量
                 time_emb = Tensor(
-                    np.random.randint(0, model.num_timesteps, (img.shape[0],)).astype(np.int32))
-
+                    np.random.randint(0, num_timesteps, (img.shape[0],)).astype(np.int32))
+                noise = Tensor(np.random.randn(*img.shape), mindspore.float32)
                 # 返回损失、计算梯度、更新梯度
-                loss = train_step(img, time_emb)
+                self_cond = random.random() < 0.5 if self.self_condition else False
+                loss = train_step(img, time_emb, noise, self_cond)
 
                 # 损失累加
                 total_loss += float(loss.asnumpy())
