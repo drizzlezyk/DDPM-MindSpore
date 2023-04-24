@@ -41,7 +41,8 @@ class EMA(nn.Cell):
         update_every=10,
         inv_gamma=1.0,
         power=2 / 3,
-        min_value=0.0
+        min_value=0.0,
+        ignore_names=set(),
     ):
         super().__init__()
         self.beta = beta
@@ -57,6 +58,8 @@ class EMA(nn.Cell):
         self.power = power
         self.min_value = min_value
 
+        self.ignore_names = ignore_names
+
         self.inited = Parameter(Tensor(False), 'inited')
         self.step = Parameter(Tensor(0, mindspore.int32), 'step')
 
@@ -67,7 +70,7 @@ class EMA(nn.Cell):
         return success
 
     def get_current_decay(self):
-        epoch = clamp(self.step - self.update_after_step - 1, min_value = 0.)
+        epoch = clamp(self.step - self.update_after_step - 1, min_value=0.)
         value = 1 - (1 + epoch / self.inv_gamma) ** - self.power
 
         if epoch <= 0.:
@@ -93,9 +96,9 @@ class EMA(nn.Cell):
         return success
 
     def update_moving_average(self):
-        def moving_average(decay, ma_param, current_param):
+        def moving_average(current_decay, ma_param, current_param):
             difference = ma_param - current_param
-            difference = difference * (1.0 - decay)
+            difference = difference * (1.0 - current_decay)
             return ops.assign(ma_param, ma_param - difference)
 
         current_decay = self.get_current_decay()
