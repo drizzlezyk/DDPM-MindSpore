@@ -593,14 +593,14 @@ class Unet(nn.Cell):
         self.final_res_block.recompute()
         self.final_conv = Conv2d(dim, self.out_dim, 1, pad_mode='valid', has_bias=True)
         self.final_conv.recompute()
-        self.Concat = ops.Concat(axis=1)
-        self.Concat.recompute()
+        # self.Concat = ops.concat(axis=1)
+        # self.Concat.recompute()
 
     def construct(self, x, time, x_self_cond):
         if self.self_condition:
             if x_self_cond is None:
                 x_self_cond = ops.zeros_like(x)
-            x = self.Concat((x_self_cond, x))
+            x = ops.concat((x_self_cond, x), 1)
         x = self.init_conv(x)
         r = x.copy()
         t = self.time_mlp(time)
@@ -622,18 +622,18 @@ class Unet(nn.Cell):
 
         len_h = len(h) - 1
         for block1, block2, attn, upsample in self.ups:
-            x = self.Concat((x, h[len_h]))
+            x = ops.concat((x, h[len_h]), 1)
             len_h -= 1
             x = block1(x, t)
 
-            x = self.Concat((x, h[len_h]))
+            x = ops.concat((x, h[len_h]), 1)
             len_h -= 1
             x = block2(x, t)
             x = attn(x)
 
             x = upsample(x)
 
-        x = self.Concat((x, r))
+        x = ops.concat((x, r), 1)
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
@@ -679,7 +679,7 @@ def generate_noise(x, data_type=None):
     return normal(x.shape).astype(data_type)
 
 
-def generate_t_tensor(t, data_type=mindspore.float16):
+def generate_t_tensor(t, data_type=mindspore.float32):
     return Tensor(t, data_type)
 
 
@@ -1010,6 +1010,7 @@ class Trainer:
     ):
         super().__init__()
         self.amp_level = amp_level
+        self.jit = jit
         self.self_condition = self_condition
         device_id = int(os.getenv('DEVICE_ID', "0"))
         mindspore.set_context(device_id=device_id)
@@ -1102,17 +1103,12 @@ class Trainer:
     def train(self):
         model = self.model
         accumulator = self.accumulator
-        gradient_accumulate_every = self.gradient_accumulate_every
-        model = auto_mixed_precision(model, "O1")
-        grad_reducer = ops.identity
+        grad_acc = self.gradient_accumulate_every
+        self_condition = model.self_condition
         num_timesteps = model.num_timesteps
-        if self.distributed:
-            mean = _get_gradients_mean()
-            degree = _get_device_num()
-            grad_reducer = nn.DistributedGradReducer(self.opt.parameters, mean, degree)
-        else:
-            grad_reducer = ops.identity
 
+        # auto mixed precision
+        model = auto_mixed_precision(model, self.amp_level)
         if self.amp_level != 'O0':
             if self.dynamic_loss_scale:
                 loss_scaler = DynamicLossScaler(65536, 2, 1000)
@@ -1121,9 +1117,16 @@ class Trainer:
         else:
             loss_scaler = NoLossScaler()
 
+        if self.distributed:
+            mean = _get_gradients_mean()
+            degree = _get_device_num()
+            grad_reducer = nn.DistributedGradReducer(self.opt.parameters, mean, degree)
+        else:
+            grad_reducer = ops.identity
+
         def forward_fn(data, t, noise, self_cond):
             loss = model(data, t, noise, self_cond)
-            loss = loss / gradient_accumulate_every
+            loss = loss / grad_acc
             loss = loss_scaler.scale(loss)
             return loss
 
@@ -1137,53 +1140,56 @@ class Trainer:
                 loss = loss_scaler.unscale(loss)
                 grads = loss_scaler.unscale(grads)
                 loss = ops.depend(loss, accumulator(grads))
+                # grads = ops.clip_by_global_norm(grads, 1.0)
+                # loss = ops.depend(loss, optimizer(grads))
             loss = ops.depend(loss, loss_scaler.adjust(status))
             return loss
 
-        train_step = ms_function(train_step)
+        if self.jit:
+            train_step = ms_function(train_step)
 
         data_iterator = self.dataset.create_tuple_iterator()
-
-        print('training start')
-        with tqdm(initial=self.step, total=self.train_num_steps, disable=False) as pbar:
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not self.is_main_process) as pbar:
             total_loss = 0.
-            for (img,) in data_iterator:
+            for (data,) in data_iterator:
                 model.set_train()
-                # # 随机采样time向量
-                time_emb = Tensor(
-                    np.random.randint(0, num_timesteps, (img.shape[0],)).astype(np.int32))
-                noise = Tensor(np.random.randn(*img.shape), mindspore.float32)
-                # 返回损失、计算梯度、更新梯度
-                self_cond = random.random() < 0.5 if self.self_condition else False
-                loss = train_step(img, time_emb, noise, self_cond)
 
-                # 损失累加
+                self_cond = random.random() < 0.5 if self_condition else False
+                b = data.shape[0]
+
+                # 采样时间
+                t = Tensor(np.random.randint(0, num_timesteps, (b,)).astype(np.int32))
+                noise = Tensor(np.random.randn(*data.shape), mindspore.float32)
+                loss = train_step(data, t, noise, self_cond)
                 total_loss += float(loss.asnumpy())
 
                 self.step += 1
-                if self.step % gradient_accumulate_every == 0:
-                    # ema和model的参数同步更新
-                    self.ema.update()
+                if self.step % self.gradient_accumulate_every == 0:
+                    if self.is_main_process:
+                        self.ema.update()
                     pbar.set_description(f'loss: {total_loss:.4f}')
                     pbar.update(1)
                     total_loss = 0.
 
-                accumulate_step = self.step // gradient_accumulate_every
-                accumulate_remain_step = self.step % gradient_accumulate_every
-                if self.step != 0 and accumulate_step % self.save_and_sample_every == 0\
-                        and accumulate_remain_step == 0:
+                if self.is_main_process:
+                    accumulate_step = self.step // self.gradient_accumulate_every
+                    accumulate_remain_step = self.step % self.gradient_accumulate_every
+                    if accumulate_step != 0 and \
+                        accumulate_step % self.save_and_sample_every == 0 and \
+                        accumulate_remain_step == (self.gradient_accumulate_every - 1):
 
-                    self.ema.set_train(False)
-                    self.ema.synchronize()
-                    batches = num_to_groups(self.num_samples, self.batch_size)
-                    all_images_list = list(map(lambda n: self.ema.online_model.sample(batch_size=n),
-                                               batches))
-                    self.save_images(all_images_list, accumulate_step)
-                    self.save(accumulate_step)
-                    self.ema.desynchronize()
+                        self.ema.set_train(False)
+                        # model -> swap, ema -> model
+                        self.ema.synchronize()
 
-                if self.step >= gradient_accumulate_every * self.train_num_steps:
+                        batches = num_to_groups(self.num_samples, self.batch_size)
+                        all_images_list = list(map(lambda n: self.ema.online_model.sample(batch_size=n),
+                                                   batches))
+                        self.save_images(all_images_list, accumulate_step)
+                        self.save(accumulate_step)
+                        self.ema.desynchronize()
+
+                if self.step >= self.gradient_accumulate_every * self.train_num_steps:
                     break
 
         print('training complete')
-
