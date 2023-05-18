@@ -593,8 +593,6 @@ class Unet(nn.Cell):
         self.final_res_block.recompute()
         self.final_conv = Conv2d(dim, self.out_dim, 1, pad_mode='valid', has_bias=True)
         self.final_conv.recompute()
-        # self.Concat = ops.concat(axis=1)
-        # self.Concat.recompute()
 
     def construct(self, x, time, x_self_cond):
         if self.self_condition:
@@ -639,7 +637,6 @@ class Unet(nn.Cell):
         return self.final_conv(x)
 
 
-# Gaussian diffusion class
 def normalize_to_neg_one_to_one(img):
     return img * 2 - 1
 
@@ -694,7 +691,6 @@ class GaussianDiffusion(nn.Cell):
         loss_type='l1',
         objective='pred_noise',
         beta_schedule='cosine',
-        # p2 loss weight, - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_gamma=0.,
         p2_loss_weight_k=1,
         ddim_sampling_eta=1.,
@@ -731,7 +727,6 @@ class GaussianDiffusion(nn.Cell):
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
-        # sampling related parameters
         # default num sampling timesteps to number of timesteps at training
         self.sampling_timesteps = default(sampling_timesteps, timesteps)
         assert self.sampling_timesteps <= timesteps
@@ -889,7 +884,6 @@ class GaussianDiffusion(nn.Cell):
         x_start = None
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
-            # time_cond = ops.fill(mindspore.int32, (batch,), time)
             time_cond = np.full((batch,), time).astype(np.int32)
             x_start = Tensor(x_start) if x_start is not None else x_start
             self_cond = x_start if self.self_condition else None
@@ -1140,8 +1134,6 @@ class Trainer:
                 loss = loss_scaler.unscale(loss)
                 grads = loss_scaler.unscale(grads)
                 loss = ops.depend(loss, accumulator(grads))
-                # grads = ops.clip_by_global_norm(grads, 1.0)
-                # loss = ops.depend(loss, optimizer(grads))
             loss = ops.depend(loss, loss_scaler.adjust(status))
             return loss
 
@@ -1149,7 +1141,7 @@ class Trainer:
             train_step = ms_function(train_step)
 
         data_iterator = self.dataset.create_tuple_iterator()
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not self.is_main_process) as pbar:
+        with tqdm(initial=self.step, total=self.train_num_steps, disable=not self.is_main_process) as pbar:
             total_loss = 0.
             for (data,) in data_iterator:
                 model.set_train()
@@ -1179,7 +1171,6 @@ class Trainer:
                         accumulate_remain_step == (self.gradient_accumulate_every - 1):
 
                         self.ema.set_train(False)
-                        # model -> swap, ema -> model
                         self.ema.synchronize()
 
                         batches = num_to_groups(self.num_samples, self.batch_size)

@@ -52,7 +52,6 @@ def auto_mixed_precision(network, amp_level='O1'):
     """auto mixed precision cast."""
     if amp_level == 'O0':
         if mindspore.get_context('device_target') == 'Ascend':
-            amp_level = 'O1'
             print(
                 'Model on Ascend must use auto mixed precision, the "amp_level" will be set to "O1".'
             )
